@@ -1,0 +1,14 @@
+{
+    "mqtt": {
+        "clientId": "EHSMonitor",
+        "prefix": "ehsMonitor",
+        "server": "mqttServer",
+        "port": 1883,
+        "username": "SomeMQTTUsername",
+        "password": "SomeMQTTPassword",
+    },
+    "ehs": {
+        "nasaDevice": "/dev/ttyUSB0",
+        "rawNasaWritePath": "/root/nasa.log"
+    }
+}
