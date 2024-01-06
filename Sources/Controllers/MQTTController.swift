@@ -8,26 +8,13 @@
 import Foundation
 import MQTTNIO
 
-
-@MainActor
-final class MQTTController
+actor MQTTController
 {
-    
-    private var client: MQTTClient {
-        didSet {
-            self.connected = false
-            self.subscribed = false
-        }
-    }
-    
-    public private(set) var connected: Bool = false
-    public private(set) var subscribed: Bool = false
+    private let client: MQTTClient
     
     let prefix: String
     
-    static private let reconnectTime: TimeInterval = 30
-    
-    init(
+    public init(
         configuration: Configuration.MQTT
     ) {
         self.prefix = configuration.prefix
@@ -39,7 +26,7 @@ final class MQTTController
             clean: true,
             credentials: .init(username: configuration.username, password: configuration.password),
             willMessage: nil,
-            reconnectMode: .none
+            reconnectMode: .retry(minimumDelay: .seconds(1), maximumDelay: .seconds(10))
         )
         
         self.client = MQTTClient(
@@ -47,96 +34,27 @@ final class MQTTController
             eventLoopGroupProvider: .createNew
         )
         
-        self.configureClient(self.client)
+        logger.info("Connecting ...")
         
-        self.connect()
+        client.whenConnected { response in
+            logger.info("Connected!")
+        }
+        
+        client.whenConnectionFailure { error in
+            logger.error("Connection Failure: \(error)")
+        }
+        
+        client.connect()
     }
     
-    private func generateId() -> Int32
+    public func shutdown() async throws
     {
-        if self.previousId == Int32.max
-        {
-            self.previousId = -1
-        }
-        self.previousId += 1
-        return self.previousId
-    }
-    private var previousId: Int32 = -1
-    
-    private func configureClient(_ client: MQTTClient)
-    {
-        client.whenConnected { [weak self] response in
-            DispatchQueue.main.async { [weak self] in
-                self?.connected = true
-                logger.info("Connected!")
-            }
-        }
-        
-        client.whenDisconnected { [weak self] reason in
-            DispatchQueue.main.async { [weak self] in
-                self?.connected = false
-                logger.info("Disconnected: \(reason)")
-                
-                DispatchQueue.main.asyncAfter(deadline: .now() + Self.reconnectTime) { [weak self] in
-                    self?.connect()
-                }
-            }
-        }
-        
-        client.whenConnectionFailure { [weak self] error in
-            DispatchQueue.main.async { [weak self] in
-                self?.connected = false
-                logger.error("ConnectionFailure: \(error)")
-                
-                DispatchQueue.main.asyncAfter(deadline: .now() + Self.reconnectTime) { [weak self] in
-                    self?.connect()
-                }
-            }
-        }
-    }
-    
-    private var incomingMessageTask: Task<Void, Never>?
-    
-    private var connectTask: Task<Void, Error>?
-    
-    public func connect()
-    {
-        self.connectTask = Task { [weak self] in
-            guard let self = self else { return }
-            
-            while true
-            {
-                do {
-                    logger.info("Connecting ...")
-                    try await self.client.connect()
-                    return
-                } catch {
-                    logger.error("Connect: \(error)")
-                }
-                
-                try await Task.sleep(seconds: Self.reconnectTime)
-            }
-        }
-    }
-    
-    
-    private var subscribeTask: Task<Void, Error>?
-    
-    func shutdown() async throws
-    {
-        self.connectTask = nil
-        
-        self.client.whenDisconnected { reason in
-            return
-        }
-        
-        
         try await self.client.disconnect()
     }
     
     func publish(string: String, topic: String, qos: MQTTQoS = .atMostOnce, retain: Bool = false) async throws
     {
-        guard self.connected else { throw MQTTPublishError.notConnected }
+        guard self.client.isConnected else { throw MQTTPublishError.notConnected }
         
         try await self.client.publish(.init(string), to: self.prefix + "/" + topic, qos: qos, retain: retain)
     }
@@ -150,7 +68,7 @@ final class MQTTController
     ///   - retain: MQTT Message Retain flag
     func publish(data: Data, topic: String, qos: MQTTQoS, retain: Bool) async throws
     {
-        guard self.connected else { throw MQTTPublishError.notConnected }
+        guard self.client.isConnected else { throw MQTTPublishError.notConnected }
 
         guard let string = String(data: data, encoding: .utf8) else { throw MQTTPublishError.dataDoesNotConvertToString }
         
