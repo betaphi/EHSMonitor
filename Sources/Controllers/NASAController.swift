@@ -48,7 +48,7 @@ final class NASAController: @unchecked Sendable
             transmitRate: .baud9600,
             minimumBytesToRead: 0,
             timeout: 0,
-            parityType: .even,
+            parityType: .none,
             sendTwoStopBits: false,
             dataBitsSize: .bits8,
             useHardwareFlowControl: true,
