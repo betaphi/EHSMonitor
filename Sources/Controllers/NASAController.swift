@@ -42,6 +42,8 @@ final class NASAController: @unchecked Sendable
         
         self.port = SerialPort(path: device)
         
+        try self.port.openPort(toReceive: true, andTransmit: true)
+        
         // configure port
         self.port.setSettings(
             receiveRate: .baud9600,
@@ -55,8 +57,6 @@ final class NASAController: @unchecked Sendable
             useSoftwareFlowControl: false,
             processOutput: false
         )
-        
-        try self.port.openPort(toReceive: true, andTransmit: true)
         
         self.addReadToQueue()
     }
