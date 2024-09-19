@@ -10,7 +10,7 @@ Connect the Samsung Indoor Unit or Wifi Kit F1/F2 Connectors to an RS485 Adapter
 F1 -> A+
 F2 -> B-
 
-more detailed description under [wiki]([https://www.google.com](https://wiki.myehs.eu/wiki/F1/F2_connector))
+more detailed description under [wiki](https://wiki.myehs.eu/wiki/F1/F2_connector)
 
 ## Run from Dockerfile
 1. Clone this repository
