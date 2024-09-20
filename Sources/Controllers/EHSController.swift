@@ -135,13 +135,13 @@ final class EHSController
             
             let nasaController: NASAController
             do {
-                nasaController = try NASAController(device: configuration.nasaDevice, writeRawDataPath: configuration.rawNasaWritePath, enableDebugLogging: false)
+                nasaController = try await NASAController(device: configuration.nasaDevice, writeRawDataPath: configuration.rawNasaWritePath, enableDebugLogging: false)
             } catch {
                 logger.error("Initialize NASAController: \(error)")
                 fatalError("Error initializing NASAController")
             }
             
-            for await packet in nasaController.packets
+            for await packet in await nasaController.packets
             {
                 do {
                     try await self.process(packet: packet)

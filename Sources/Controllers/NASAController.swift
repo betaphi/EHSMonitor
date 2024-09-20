@@ -7,9 +7,10 @@
 
 import Foundation
 import NASAKit
+import Collections
+import AsyncAlgorithms
 
-
-final class NASAController: @unchecked Sendable
+actor NASAController
 {
     /// The amount of time to wait from the last byte read to writing bytes
     private static let readToWriteDelay: TimeInterval = 0.05 // 50ms
@@ -23,191 +24,150 @@ final class NASAController: @unchecked Sendable
     
     private let port: SerialPort
     
-    /// The queue that is used to access the serial port
-    private let serialQueue = DispatchQueue(label: "NASASerial")
+    private var readWriteTask: Task<Void, Error>?
+    private var autoDiscoveryTask: Task<Void, Error>?
     
-    /// The queue that is used to write packets
-    private let writeQueue = DispatchQueue(label: "NASAWrite")
+    private let nasaDecoder = NASADecoder(enableDebugLogging: false)
     
+    let packets = AsyncChannel<Packet>()
+    
+    /// The date when bytes were last read.
+    /// Used to orchestrate a delay between receiving and sending bytes.
+    private var previousByteRead: Date = .now
+    
+    private struct Write
+    {
+        var packet: Packet
+        var bytes: [UInt8]
+    }
+    
+    private var writeBuffer: Deque<Write> = []
+    
+    public struct DiscoveredUnit: Hashable
+    {
+        var address: NASAKit.Address
+    }
+    
+    /// The set of discovered units
+    public private(set) var discoveredUnits: Set<DiscoveredUnit> = []
+    
+    private func discover(address: NASAKit.Address)
+    {
+        let (inserted, object) = self.discoveredUnits.insert(.init(address: address))
+        
+        if inserted
+        {
+            logger.info("Discovered \(object)")
+        }
+    }
+
     init(
         device: String,
         writeRawDataPath: String?,
         enableDebugLogging: Bool
-    ) throws {
+    ) async throws {
         self.device = device
         self.writeRawDataPath = writeRawDataPath
         self.enableDebugLogging = enableDebugLogging
         
         logger.info("Initializing NASA at \(device) with debugLogging: \(enableDebugLogging)")
         
-        self.port = SerialPort(path: device)
+        self.port = .init(path: device)
         
+        try await self.start()
+    }
+    
+    deinit {
+        self.readWriteTask?.cancel()
+        self.autoDiscoveryTask?.cancel()
+    }
+    
+    /// Start reading and writing the Serial port
+    private func start() async throws
+    {
         try self.port.openPort(toReceive: true, andTransmit: true)
         
-        // configure port
         self.port.setSettings(
             receiveRate: .baud9600,
             transmitRate: .baud9600,
             minimumBytesToRead: 0,
             timeout: 0,
-            parityType: .none,
+            parityType: .even,
             sendTwoStopBits: false,
             dataBitsSize: .bits8,
-            useHardwareFlowControl: true,
+            useHardwareFlowControl: false,
             useSoftwareFlowControl: false,
             processOutput: false
         )
         
-        self.addReadToQueue()
-    }
-    
-    /// The date when bytes were last read.
-    /// Used to orchestrate a delay between receiving and sending bytes.
-    private var previousByteRead: Date = .now
-    
-    
-    private func addReadToQueue()
-    {
-        self.serialQueue.async { [weak self] in
-            self?.read()
-        }
-    }
-    
-    private func read()
-    {
-        defer {
-            // loop
-            self.addReadToQueue()
+        self.readWriteTask = Task.detached { [weak self] in
+            while Task.isCancelled == false
+            {
+                guard let self else { return }
+                try await self.readWrite()
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            
+            await self?.port.closePort()
         }
         
-        guard let bytes = try? self.port.readData(ofLength: Self.maximumReadSize),
-              bytes.isEmpty == false else
+        self.autoDiscoveryTask = Task.detached { [weak self, nasaDecoder] in
+            for await packet in await nasaDecoder.packets
+            {
+                guard let self else { return }
+                await self.discover(address: packet.source)
+                await self.packets.send(packet)
+            }
+        }
+    }
+    
+    /// Internal function that is executed regularly in order to read and/or write bytes from and to the Serial port
+    private func readWrite() async throws
+    {
+        if let bytes = try await self.read()
         {
-            // read failed or no bytes to read
+            //self.log("Received \(bytes.count) bytes", level: .trace)
+            
+            let date = Date()
+            await self.nasaDecoder.decodeBytes(bytes, date: date)
+            self.previousByteRead = date
+            
+            Self.writeToFile(data: Data(bytes), date: date, path: self.writeRawDataPath)
+            
             return
         }
+
+        // did not read bytes -> maybe write
+        guard Date().timeIntervalSince(self.previousByteRead) >= Self.readToWriteDelay else { return }
+        guard let write = self.writeBuffer.popFirst() else { return }
         
-        // we have received bytes
-        self.previousByteRead = Date()
+        let _ = try self.port.writeData(.init(write.bytes))
         
-        self.byteStreamContinuation?.yield([UInt8](bytes))
+        Self.writeToFile(data: Data(write.bytes), date: .now, path: self.writeRawDataPath)
+        
+        logger.trace("didWrite: \(write.packet.id)")
     }
     
-    private var byteStreamContinuation: AsyncStream<[UInt8]>.Continuation?
+    private func read() async throws -> [UInt8]?
+    {
+        let bytes = try self.port.readData(ofLength: Self.maximumReadSize)
+        guard bytes.isEmpty == false else { return nil }
+        
+        return [UInt8](bytes)
+    }
     
+    /// Write packet to the Serial Port
+    /// - Parameter packet: The Packet to write
     public func write(packet: Packet) async throws
     {
         let data = try packet.encode()
+        let write = Write(packet: packet, bytes: data)
+        self.writeBuffer.append(write)
         
-        let _: Void = try await withCheckedThrowingContinuation { [weak self] continuation in
-            
-            guard let self = self else {
-                continuation.resume(throwing: CancellationError())
-                return
-            }
-            
-            // Add the data to the write queue
-            self.writeQueue.async { [weak self] in
-                
-                // check if NASAController is already deinited
-                guard let self = self else {
-                    continuation.resume(throwing: CancellationError())
-                    return
-                }
-                
-                // use to make sure to only write once
-                var written = false
-                
-                // try to write as long as the write was not performed
-                while written == false
-                {
-                    // Perform write on the serialQueue
-                    self.serialQueue.sync { [weak self] in
-                        
-                        // check if NASAController is already deinited
-                        guard let self = self else {
-                            // end the while loop
-                            written = true
-                            
-                            // notify the continuation
-                            continuation.resume(throwing: CancellationError())
-                            
-                            return
-                        }
-                        
-                        do {
-                            // check for read to write delay
-                            guard Date().timeIntervalSince(self.previousByteRead) > Self.readToWriteDelay else {
-                                // have to wait some more
-                                // as written is false, the loop will make sure the next
-                                // write attempt is scheduled
-                                return
-                            }
-                            
-                            // the delay since the last read has passed
-                            // => this is the final write attempt
-                            // Either it will succeed or fail but we will not retry
-                            defer {
-                                written = true
-                            }
-                            
-                            // write the data
-                            let _ = try self.port.writeData(.init(data))
-                            
-                            // notify the continuation
-                            continuation.resume()
-                        } catch {
-                            
-                            // write failed, notify the continuation
-                            continuation.resume(throwing: error)
-                        }
-                    }
-                }
-            }
-        }
+        logger.trace("didQueue: \(write.packet.id)")
     }
-    
-    var packets: AsyncStream<Packet>
-    {
-        let byteStream = AsyncStream<[UInt8]> { [weak self] continuation in
-            
-            self?.byteStreamContinuation = continuation
-            
-            continuation.onTermination = { [weak self] _ in
-                self?.byteStreamContinuation = nil
-            }
-        }
-        
-        return AsyncStream<Packet> { continuation in
-            
-            let nasaDecoder = NASADecoder(enableDebugLogging: enableDebugLogging)
-            
-            let packetTask = Task {
-                for await packet in await nasaDecoder.packets
-                {
-                    continuation.yield(packet)
-                }
-                
-                continuation.finish()
-            }
-            
-            let decodeTask = Task {
-                for await bytes in byteStream
-                {
-                    let currentDate = Date()
-                    Self.writeToFile(data: Data(bytes), date: currentDate, path: writeRawDataPath)
-                    await nasaDecoder.decodeBytes(bytes, date: currentDate)
-                }
-            }
-            
-            continuation.onTermination = { _ in
-                decodeTask.cancel()
-                packetTask.cancel()
-            }
-        }
-    }
-    
 
+    // MARK: - Static Helper Functions
     private static let formatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
